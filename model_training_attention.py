@@ -124,6 +124,8 @@ class MIA_train: # main class for every thing
         torch.manual_seed(random_seed)
         np.random.seed(random_seed)
         self.arch = arch
+        # Unified device selection ensures consistent CUDA/CPU behavior
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.bhtsne = bhtsne_option
         self.batch_size = batch_size
         self.lr = learning_rate
@@ -409,14 +411,10 @@ class MIA_train: # main class for every thing
         self.f = model.local_list[0]
         self.f_tail = model.cloud
         self.classifier = model.classifier
-        if torch.cuda.is_available():
-            self.f.cuda()
-            self.f_tail.cuda()
-            self.classifier.cuda()
-        else:
-            self.f.cpu()
-            self.f_tail.cpu()
-            self.classifier.cpu()
+        # Move core modules to selected device
+        self.f.to(self.device)
+        self.f_tail.to(self.device)
+        self.classifier.to(self.device)
         
         # Initialize attention classifier if enabled
         self.attention_classifier = None
@@ -434,10 +432,7 @@ class MIA_train: # main class for every thing
                 num_heads=self.attention_heads,
                 dropout=self.attention_dropout
             )
-            if torch.cuda.is_available():
-                self.attention_classifier.cuda()
-            else:
-                self.attention_classifier.cpu()
+            self.attention_classifier.to(self.device)
             
             # Add attention classifier parameters to optimizer
             self.params = list(self.f_tail.parameters()) + list(self.classifier.parameters()) + list(self.attention_classifier.parameters())
@@ -510,7 +505,7 @@ class MIA_train: # main class for every thing
                 raise ("No such GAN AE type.")
             self.gan_params.append(self.local_AE_list[i].parameters())
             self.local_AE_list[i].apply(init_weights)
-            self.local_AE_list[i].cuda()
+            self.local_AE_list[i].to(self.device)
             
             self.gan_optimizer_list = []
             self.gan_scheduler_list = []
@@ -820,12 +815,8 @@ class MIA_train: # main class for every thing
         self.f_tail.train()
         self.classifier.train()
         self.f.train()
-        if torch.cuda.is_available():
-            x_private = x_private.cuda()
-            label_private = label_private.cuda()
-        else:
-            x_private = x_private.cpu()
-            label_private = label_private.cpu()
+        x_private = x_private.to(self.device)
+        label_private = label_private.to(self.device)
 
         # Freeze batchnorm parameter of the client-side model.
         if self.load_from_checkpoint and self.finetune_freeze_bn:
@@ -839,14 +830,14 @@ class MIA_train: # main class for every thing
         if self.use_attention_classifier:
             # Use attention classifier for feature classification
             attention_logits, enhanced_features, slot_representations, attention_weights = self.attention_classify_features(z_private, label_private)
-            rob_loss = torch.tensor(0.0)
-            intra_class_mse = torch.tensor(0.0)
+            rob_loss = torch.tensor(0.0, device=self.device)
+            intra_class_mse = torch.tensor(0.0, device=self.device)
         else:
             # Use original GMM approach
             if not random_ini_centers and self.lambd>0:
                 rob_loss,intra_class_mse = self.compute_class_means(z_private, label_private, unique_labels, centroids_list)
             else:
-                rob_loss,intra_class_mse=torch.tensor(0.0),torch.tensor(0.0)
+                rob_loss, intra_class_mse = torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
         # assert 1==0, print(x_private.shape,label_private.shape,unique_values)
         # Final Prediction Logits (complete forward pass)
         if "Gaussian" in self.regularization_option: # and adding_noise:
@@ -857,30 +848,21 @@ class MIA_train: # main class for every thing
                     sigma = self.regularization_strength
             else:
                 sigma = self.regularization_strength
-            if torch.cuda.is_available():
-                noise = sigma * torch.randn_like(z_private).cuda()
-            else:
-                noise = sigma * torch.randn_like(z_private)
-            z_private_n =z_private + noise
+            noise = sigma * torch.randn_like(z_private)
+            z_private_n = z_private + noise
         else:
             z_private_n=z_private
         # Perform various activation defenses, default no defense
         if self.local_DP:
             if "laplace" in self.AT_regularization_option:
-                if torch.cuda.is_available():
-                    noise = torch.from_numpy(
-                        np.random.laplace(loc=0, scale=1 / self.dp_epsilon, size=z_private.size())).cuda()
-                else:
-                    noise = torch.from_numpy(
-                        np.random.laplace(loc=0, scale=1 / self.dp_epsilon, size=z_private.size()))
+                noise = torch.from_numpy(
+                    np.random.laplace(loc=0, scale=1 / self.dp_epsilon, size=z_private.size())
+                ).to(self.device)
                 z_private = z_private + noise.detach().float()
             else:  # apply gaussian noise
                 delta = 10e-5
                 sigma = np.sqrt(2 * np.log(1.25 / delta)) * 1 / self.dp_epsilon
-                if torch.cuda.is_available():
-                    noise = sigma * torch.randn_like(z_private).cuda()
-                else:
-                    noise = sigma * torch.randn_like(z_private)
+                noise = sigma * torch.randn_like(z_private)
                 z_private = z_private + noise.detach().float()
         if self.dropout_defense:
             z_private = dropout_defense(z_private, self.dropout_ratio)
@@ -891,8 +873,8 @@ class MIA_train: # main class for every thing
             
             self.local_AE_list[client_id].eval()
             fake_act = z_private.clone()
-            grad = torch.zeros_like(z_private).cuda()
-            fake_act = torch.autograd.Variable(fake_act.cuda(), requires_grad=True)
+            grad = torch.zeros_like(z_private).to(self.device)
+            fake_act = torch.autograd.Variable(fake_act.to(self.device), requires_grad=True)
             x_recon = self.local_AE_list[client_id](fake_act)
             x_private = denormalize(x_private, self.dataset)
             
@@ -1008,6 +990,7 @@ class MIA_train: # main class for every thing
         # batch_time = AverageMeter()
         losses = AverageMeter()
         top1 = AverageMeter()
+        mse_meter = AverageMeter()
         val_loader = self.pub_dataloader
 
         # switch to evaluate mode
@@ -1050,8 +1033,8 @@ class MIA_train: # main class for every thing
 
 
         for i, (input, target) in enumerate(val_loader):
-            input = input.cuda()
-            target = target.cuda()
+            input = input.to(self.device)
+            target = target.to(self.device)
             activation_0 = {}
             # compute output
             with torch.no_grad():
@@ -1066,17 +1049,17 @@ class MIA_train: # main class for every thing
                     exit()
                 if "Gaussian" in self.regularization_option:
                     sigma = self.regularization_strength
-                    noise = sigma * torch.randn_like(output).cuda()
+                    noise = sigma * torch.randn_like(output)
                     output += noise
                 '''Optional, Test validation performance with local_DP/dropout (apply DP during query)'''
                 if self.local_DP:
                     if "laplace" in self.AT_regularization_option:
                         noise = torch.from_numpy(
-                            np.random.laplace(loc=0, scale=1 / self.dp_epsilon, size=output.size())).cuda()
+                            np.random.laplace(loc=0, scale=1 / self.dp_epsilon, size=output.size())).to(self.device)
                     else:  # apply gaussian noise
                         delta = 10e-5
                         sigma = np.sqrt(2 * np.log(1.25 / delta)) * 1 / self.dp_epsilon
-                        noise = sigma * torch.randn_like(output).cuda()
+                        noise = sigma * torch.randn_like(output)
                     output += noise
                 if self.dropout_defense:
                     output = dropout_defense(output, self.dropout_ratio)
@@ -1089,8 +1072,8 @@ class MIA_train: # main class for every thing
                 
                 self.local_AE_list[client_id].eval()
                 fake_act = output.clone()
-                grad = torch.zeros_like(output).cuda()
-                fake_act = torch.autograd.Variable(fake_act.cuda(), requires_grad=True)
+                grad = torch.zeros_like(output).to(self.device)
+                fake_act = torch.autograd.Variable(fake_act.to(self.device), requires_grad=True)
                 x_recon = self.local_AE_list[client_id](fake_act)
                 
                 input = denormalize(input, self.dataset)
@@ -1129,6 +1112,14 @@ class MIA_train: # main class for every thing
                         output = output.view(output.size(0), -1)
                         output = self.classifier(output)
                 loss = criterion(output, target)
+                # Compute MSE between softmax probs and one-hot labels for reporting
+                with torch.no_grad():
+                    probs = F.softmax(output, dim=1)
+                    one_hot = F.one_hot(target, num_classes=self.num_class).float()
+                    mse_val = F.mse_loss(probs, one_hot)
+                    if i == 0:
+                        mse_meter = AverageMeter()
+                    mse_meter.update(mse_val.item(), input.size(0))
 
 
             # Get statistics of server/client's per-layer activation
@@ -1183,8 +1174,17 @@ class MIA_train: # main class for every thing
         #     self.writer.add_histogram("local_params/{}".format(name), param.clone().cpu().data.numpy(), 1)
         # for name, param in self.model.cloud.named_parameters():
         #     self.writer.add_histogram("server_params/{}".format(name), param.clone().cpu().data.numpy(), 1)
-        self.logger.debug(' * Prec@1 {top1.avg:.3f}'
-                          .format(top1=top1))
+        # Log accuracy and MSE (if computed)
+        try:
+            self.writer.add_scalar('valid_loss/cross_entropy', losses.avg)
+            self.writer.add_scalar('valid_acc/top1', top1.avg)
+            if 'mse_meter' in locals():
+                self.writer.add_scalar('valid_loss/mse', mse_meter.avg)
+                self.logger.debug(' * Prec@1 {acc:.3f}  MSE {mse:.6f}'.format(acc=top1.avg, mse=mse_meter.avg))
+            else:
+                self.logger.debug(' * Prec@1 {acc:.3f}'.format(acc=top1.avg))
+        except Exception:
+            pass
 
         return top1.avg, losses.avg
 
@@ -1493,15 +1493,15 @@ class MIA_train: # main class for every thing
                                     client_iterator_list[client_id] = iter(self.client_dataloader[client_id])
                                     images, labels = next(client_iterator_list[client_id])
                                 self.f.eval()
-                                x_private = images.cuda()
-                                label_private = labels.cuda()
+                                x_private = images.to(self.device)
+                                label_private = labels.to(self.device)
                                 z_private = self.f(x_private)
                                 Z_all.append(z_private.cpu())
                                 label_all.append(labels.cpu()) 
                     feature_infer_etime= time.time()
                     print(f"feature_infer_one_ep_time:{feature_infer_etime - feature_infer_stime} s")
-                Z_all = torch.cat(Z_all, dim=0).cuda()
-                label_all = torch.cat(label_all, dim=0).cuda()
+                Z_all = torch.cat(Z_all, dim=0).to(self.device)
+                label_all = torch.cat(label_all, dim=0).to(self.device)
                 # print(Z_all.shape,label_all.shape)
                 
                 num_clusters=3
@@ -1523,13 +1523,13 @@ class MIA_train: # main class for every thing
                         del average_variance
 
                         # centroids, cluster_covariances, cluster_weights = self.apply_gmm_with_pca_and_inverse_transform(class_features,n_components=num_clusters, pca_components=None,iteration=10,ini_center=centroids)
-                        centroids_list[class_label] = centroids.clone().detach().cuda()
-                        cluster_weights=cluster_weights.clone().detach().cuda()
+                        centroids_list[class_label] = centroids.clone().detach().to(self.device)
+                        cluster_weights=cluster_weights.clone().detach().to(self.device)
                         # print(cluster_weights)
                         for i in range(len(cluster_covariances)):
                             # if cluster_weights<
-                            cluster_covariance=cluster_covariances[i].clone().detach().cuda()
-                            cluster_covariance = cluster_covariance + torch.eye(len(cluster_covariance)).cuda()*self.regularization_strength**2  # 确保矩阵是正定的
+                            cluster_covariance=cluster_covariances[i].clone().detach().to(self.device)
+                            cluster_covariance = cluster_covariance + torch.eye(len(cluster_covariance)).to(self.device)*self.regularization_strength**2  # 确保矩阵是正定的
                         # 使用Cholesky分解计算行列式的对数
                             # L = torch.cholesky(cluster_covariance)
                             # try:
